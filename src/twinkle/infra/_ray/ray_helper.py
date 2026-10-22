@@ -18,42 +18,20 @@ class RayHelper:
 
     @staticmethod
     def _get_ray_custom_resources(device_groups: List[DeviceGroup]) -> Dict[str, float]:
-        """Return custom accelerator resources needed for local Ray startup.
+        """Return accelerator resources needed for local Ray startup.
 
-        Ray discovers CUDA GPUs itself.  Other accelerators, such as Ascend
-        NPUs, need to be registered as Ray custom resources so that placement
-        groups can request them.
+        Ray discovers CUDA GPUs itself.  Other accelerators -- Ascend NPUs, and
+        Kunlunxin XPUs whose runtime ships no nvidia-smi -- must be registered
+        explicitly so that placement groups can request them.  Each platform
+        answers for itself via ``Platform.ray_resources()``; the detected
+        platform is authoritative because XPU runs declare their device type as
+        the cuda-alike 'GPU'.
         """
+        # ResourceManager supports one accelerator type per run.
         device_types = {group.device_type.upper() for group in device_groups} - {'CPU'}
-
-        # ResourceManager supports one accelerator type per run.  Only NPU
-        # currently needs an explicit Ray custom-resource registration.
-        if device_types == {'NPU'}:
-            try:
-                import torch
-
-                npu = getattr(torch, 'npu', None)
-                npu_count = npu.device_count() if npu is not None and npu.is_available() else 0
-            except (ImportError, AttributeError, RuntimeError):
-                return {}
-
-            return {'NPU': float(npu_count)} if npu_count > 0 else {}
-
-        # Kunlunxin XPU: Ray cannot autodetect the GPUs (no nvidia-smi on the
-        # XPU runtime), so register the cuda-alike GPU count explicitly for
-        # local ray.init. Remote workers started via `ray start` must set
-        # --num-gpus manually.
-        if device_types == {'GPU'} and Platform.get_platform().__name__ == 'XPU':
-            try:
-                import torch
-
-                gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
-            except (ImportError, AttributeError, RuntimeError):
-                return {}
-
-            return {'GPU': float(gpu_count)} if gpu_count > 0 else {}
-
-        return {}
+        if not device_types:
+            return {}
+        return Platform.get_platform().ray_resources()
 
     @staticmethod
     def init_registry():
@@ -344,6 +322,8 @@ class RayHelper:
                 deploy_pg: Dict
                 cluster_name = group
                 worker_name = key + '-' + str(pg_idx)
+                visible_devices_str = ','.join([str(r) for r in deploy_pg['gpu_rank']])
+                local_rank_str = str(0)
                 env_vars = os.environ.copy()
                 env_vars.update({
                     'WORLD_SIZE':
@@ -351,13 +331,13 @@ class RayHelper:
                     'RANK':
                     str(pg_idx),
                     'LOCAL_RANK':
-                    str(0),
+                    local_rank_str,
                     'CLUSTER_NAME':
                     cluster_name,
                     'WORKER_NAME':
                     worker_name,
                     Platform.get_platform(device_type_upper).visible_device_env():
-                    ','.join([str(r) for r in deploy_pg['gpu_rank']]),
+                    visible_devices_str,
                     'TWINKLE_MODE':
                     'ray',
                     'TWINKLE_SEED':

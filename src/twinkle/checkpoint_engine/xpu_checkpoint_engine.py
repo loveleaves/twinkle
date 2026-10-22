@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Adapted from https://github.com/baidu/vLLM-Kunlun/blob/v0.21.0-dev/vllm_kunlun/distributed/py_kunlun_communicator.py
+import os
 import pickle
 import socket
 import struct
@@ -264,6 +265,20 @@ class XCCLCheckpointEngine(NCCLCheckpointEngine):
 
         device = torch.device('cuda', devidx)
 
+        # fix: With BKCL_NONUNIFORM_VISIBLE_DEVICES=1, BKCL identifies each rank
+        # by its PCI address instead of the local device index, so colliding
+        # local indices (every single-card worker is local 0) are fine and a
+        # flat XCCL group works — measured ~30 GB/s broadcast vs the socket
+        # relay's ~0.4 GB/s. Prefer the flat group whenever nonuniform mode is
+        # on; only fall back to the (hostname, index)-collision relay scheme
+        # when nonuniform is unavailable (older libbkcl).
+        if os.environ.get('BKCL_NONUNIFORM_VISIBLE_DEVICES') == '1':
+            self._pg = _FlatPG(_build_xccl_pg(store, f'{prefix}_ws',
+                                              list(range(self.world_size)), self.rank, device))
+            logger.info(
+                f'XCCLCheckpointEngine: flat XCCL group (nonuniform), world_size={self.world_size}')
+            return
+
         # Single host assumed for the flat case; membership by first
         # occurrence of each (host, local device index) pair.
         first_owner = {}
@@ -287,6 +302,7 @@ class XCCLCheckpointEngine(NCCLCheckpointEngine):
             self._relay.setup_sockets(store, prefix)
             self._pg = self._relay
             logger.info(f'XCCLCheckpointEngine: relay mode, members={members}, excluded={sorted(excluded)}')
+
 
     def _store_barrier(self) -> None:
         prefix = self.group_name

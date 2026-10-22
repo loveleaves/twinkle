@@ -72,6 +72,27 @@ def ensure_xpu_compat() -> None:
         xp.get_device_name = _get_device_name
 
 
+def ensure_bkcl_nonuniform_env() -> None:
+    """Enable BKCL's non-uniform-visible-devices mode for Kunlunxin XPU.
+
+    BKCL identifies a rank's device by the *local* device index returned by
+    ``xpu_current_device()`` (see bkcl/src/init.cpp: ``msg.dev_id =
+    device_id``). twinkle's Ray layout gives each single-card worker its own
+    ``CUDA_VISIBLE_DEVICES`` and ``LOCAL_RANK=0``, so every rank in a group
+    reports local index 0 -> ``rank2dev`` collision -> ring build fails ->
+    collective deadlock.
+
+    Newer BKCL builds add ``BKCL_NONUNIFORM_VISIBLE_DEVICES``: when set, BKCL
+    reads each rank's PCI address (``XPUATTR_PCI_ADDRESS``) and translates it
+    to a physical device id (``pci_addr_to_default_dev_id_and_phy_id``),
+    correctly distinguishing ranks that each expose a single distinct card as
+    local index 0. This is the vendor-intended way to support the
+    one-visible-card-per-process deployment, so we opt in by default (unless
+    the user has explicitly set the variable).
+    """
+    os.environ.setdefault('BKCL_NONUNIFORM_VISIBLE_DEVICES', '1')
+
+
 class XPU(GPU):
 
     @staticmethod
@@ -110,3 +131,47 @@ class XPU(GPU):
             visible = os.environ.get(XPU.visible_device_env())
             raw = f'{socket.gethostname()}:{visible}:{device_id}'
             return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]
+
+    @staticmethod
+    def bootstrap() -> None:
+        ensure_xpu_compat()
+        # Opt into BKCL's non-uniform-visible-devices mode so that
+        # single-card-per-worker Ray layouts (LOCAL_RANK=0 on every rank) are
+        # mapped by physical PCI id instead of the colliding local index.
+        ensure_bkcl_nonuniform_env()
+
+    @staticmethod
+    def requires_unbound_default_pg() -> bool:
+        # BKCL is mounted as the 'nccl' backend, but its ``ProcessGroupXCCL``
+        # has no ``perform_nocolor_split``. A leftover ``bound_device_id``
+        # makes Megatron's ``new_group`` take the comm-split path and crash.
+        return True
+
+    @staticmethod
+    def requires_unbound_pg_for_subgroups() -> bool:
+        # Same root cause as above, but Megatron may run on a default PG that
+        # twinkle did not initialize, so the binding has to be cleared again
+        # immediately before ``initialize_model_parallel``.
+        return True
+
+    @staticmethod
+    def ray_resources():
+        # The XPU runtime ships no nvidia-smi, so Ray autodetects zero GPUs.
+        # Register the cuda-alike count explicitly; ``RayHelper`` routes the
+        # 'GPU' key through ``num_gpus`` because Ray rejects its own default
+        # resource names in ``resources=``.
+        try:
+            import torch
+
+            gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        except (ImportError, AttributeError, RuntimeError):
+            return {}
+        return {'GPU': float(gpu_count)} if gpu_count > 0 else {}
+
+    @staticmethod
+    def checkpoint_engine():
+        # Must be overridden explicitly: inheriting GPU's NCCL engine would
+        # deadlock, since directly constructing ``ProcessGroupNCCL`` hangs
+        # when two ranks share a local device index.
+        from twinkle.checkpoint_engine import XCCLCheckpointEngine
+        return XCCLCheckpointEngine, {}
